@@ -1,39 +1,44 @@
-import psutil
-import ray
-
 from transformers import pipeline
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import pickle as pkl
 import nltk
+import json
+import requests
+from os import path
 
-import time
+from config import API_TOKEN
 
-checkpoint = "sshleifer/distilbart-cnn-12-6"
+headers = {"Authorization": f"Bearer {API_TOKEN}"}
+API_URL = "https://api-inference.huggingface.co/models/"
 
+checkpoint_distilbart = "sshleifer/distilbart-cnn-12-6"
+checkpoint_prophetnet = "microsoft/prophetnet-large-uncased-cnndm"
 
-tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint)
-summarizer = pipeline("summarization", tokenizer=tokenizer, model=model)
+model_key = {"distilbart": checkpoint_distilbart, "prophetnet":checkpoint_prophetnet}
+response_key = {"distilbart": "summary_text", "prophetnet":"generated_text"}
+
+model = {"distilbart": None, "prophetnet":None}
+tokenizer = {"distilbart": None, "prophetnet":None}
+summarizer = None
+
 data = {}
 
-nltk.download('punkt')
-
-def getSentences(text):
+def getSentences(text, model_name):
   return nltk.tokenize.sent_tokenize(text)
 
-def maxSentence(textList):
-  return max([len(tokenizer.tokenize(sentence)) for sentence in textList])
+def maxSentence(textList, model_name):
+  return max([len(tokenizer[model_name].tokenize(sentence)) for sentence in textList])
 
-def getChunks(textList):
+def getChunks(textList, model_name):
   # initialize
   chunk = ""
   chunks = []
   count = -1
   for sentence in textList:
     count += 1
-    combined_length = len(tokenizer.tokenize((chunk+sentence))) # add the no. of sentence tokens to the length counter
+    combined_length = len(tokenizer[model_name].tokenize((chunk+sentence))) # add the no. of sentence tokens to the length counter
 
-    if combined_length  < tokenizer.max_len_single_sentence: # if it doesn't exceed
+    if combined_length  < tokenizer[model_name].max_len_single_sentence: # if it doesn't exceed
       chunk += sentence + " " # add the sentence to the chunk
 
       # if it is the last sentence
@@ -47,47 +52,78 @@ def getChunks(textList):
 
       # take care of the overflow sentence
       chunk += sentence + " "
-      combined_length = len(tokenizer.tokenize(sentence))
+      combined_length = len(tokenizer[model_name].tokenize(sentence))
   return chunks
 
-def summarizeAux(inputs, min_len, max_len):
+def query(payload, model_name):
+    data = json.dumps(payload)
+    response = requests.request("POST", API_URL+model_key[model_name], headers=headers, data=data)
+    return json.loads(response.content.decode("utf-8"))
+
+def summarizeAux(inputs, isAPI, model_name, min_len, max_len):
     summary = ""
+    iteration = []
     
-    print(f'Here {len(inputs)}')
-    num_cpus = psutil.cpu_count(logical=True) - 4
-    ray.init(num_cpus=num_cpus, ignore_reinit_error=True)
-    pipe_id = ray.put(summarizer)
+    if isAPI:
+      for i, input in enumerate(inputs):
+        sum_query = { "inputs" : input, "parameters" : {"min_length": min_len, "max_length": max_len}}
+        print(query(sum_query, model_name))
+        summary_aux = query(sum_query, model_name)[0][response_key[model_name]].replace('[X_SEP] ', '')
+        iteration.append(summary_aux)
+        print(f'{i+1}/{len(inputs)} {summary_aux}')
+        summary = summary + summary_aux
 
-    results =  ray.get([summarizeParalel.remote(pipe_id, input, min_len, max_len) for input in inputs])
-    ray.shutdown()
-    print("results")
-    data['summaries'].extend(results)
-    summary = ' '.join(results)
+    else:
+      for i, input in enumerate(inputs):
+        summary_aux = summarizer(input, min_length=min_len, max_length=max_len)[0]["summary_text"].replace('[X_SEP] ', '')
+        iteration.append(summary_aux)
+        print(f'{i+1}/{len(inputs)} {summary_aux}')
+        summary = summary + summary_aux
+    
+    data['summaries'].append(iteration)
 
-    if len(tokenizer.tokenize(summary)) > max_len and len(inputs) > 1:
+    if len(tokenizer[model_name].tokenize(summary)) > max_len and len(inputs) > 1:
         print("Dividing")
-        summary = divide(summary, min_len, max_len)
+        summary = divide(summary, isAPI, model_name, min_len, max_len)
     
     return summary
 
-@ray.remote
-def summarizeParalel(pipeline, text, min_len, max_len):
-    return pipeline(text, min_length=min_len, max_length=max_len)[0]['summary_text'] 
 
-def divide(text, min_len=75, max_len=300):
-  sentences = getSentences(text)
-  if maxSentence(sentences) > tokenizer.max_len_single_sentence:
+def divide(text, isAPI, model_name, min_len=75, max_len=300):
+  sentences = getSentences(text, model_name)
+  if maxSentence(sentences, model_name) > tokenizer[model_name].max_len_single_sentence:
     return "Sentence longer than tokenizer"
   else:
-    chunks = getChunks(sentences)
-    return summarizeAux(chunks, min_len, max_len)
-# function
-def displayText(content):
-    return content
+    chunks = getChunks(sentences, model_name)
+    return summarizeAux(chunks, isAPI, model_name, min_len, max_len)
 
-def summarize(content):
-  global data
+def initialize_model(model_name):
+  global model
+  model[model_name] = AutoModelForSeq2SeqLM.from_pretrained(model_key[model_name])
+
+def initialize_tokenizer(model_name):
+  global tokenizer
+  tokenizer[model_name] = AutoTokenizer.from_pretrained(model_key[model_name])
+
+
+def summarize(content, model_name, min_length, max_length):
+  global data, model, tokenizer, summarizer
   data = {'summaries': [], 'final_summary': ''}
-  final_sum = divide(content)
+  isAPI = API_TOKEN != ""
+
+  if tokenizer[model_name] == None:
+    if path.exists(f'./models/{model_name}'):
+      tokenizer[model_name] = AutoTokenizer.from_pretrained(f'./models/{model_name}')
+      if not isAPI:
+        model[model_name] = AutoModelForSeq2SeqLM.from_pretrained(f'./models/{model_name}')
+    else:
+      initialize_tokenizer(model_name)
+      if not isAPI:
+        initialize_model(model_name)
+    if not isAPI:
+      summarizer = pipeline("summarization", tokenizer=tokenizer[model_name], model=model[model_name])
+
+  final_sum = divide(content, isAPI, model_name, min_length, max_length)
   data['final_summary'] = final_sum
+
   return data

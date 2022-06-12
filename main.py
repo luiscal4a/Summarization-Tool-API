@@ -7,6 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 class Document(BaseModel):
     content: str
+    model: str
+    min_length: int = 75
+    max_length: int = 300
 
 app = FastAPI()
 
@@ -30,15 +33,8 @@ def read_root():
 
 @app.post("/display/")
 async def display_text(document: Document):
-    print("hello")
     return displayText(document.content)
 
 @app.post("/summarize/")
 async def summarize_text(document: Document):
-    print("hello")
-    return summarize(document.content)
-
-
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: Optional[str] = None):
-    return {"item_id": item_id, "q": q}
+    return summarize(document.content, document.model, document.min_length, document.max_length)
